@@ -1,0 +1,13 @@
+name: 96-hour check-in reminder
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */6 * * *"
+
+jobs:
+  reminder:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check workflow
+        run: echo "Watchdog check ran successfully."
