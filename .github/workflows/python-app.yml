@@ -1,13 +1,81 @@
-name: 96-hour check-in reminder
+
+name: 96-hour check-in watchdog
 
 on:
   workflow_dispatch:
   schedule:
     - cron: "0 */6 * * *"
 
+permissions:
+  contents: write
+
 jobs:
-  reminder:
+  watchdog:
     runs-on: ubuntu-latest
     steps:
-      - name: Check workflow
-        run: echo "Watchdog check ran successfully."
+      - name: Get repository files
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Record my check-in
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          python -c "from datetime import datetime, timezone; open('last_checkin.txt','w').write(datetime.now(timezone.utc).isoformat())"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add last_checkin.txt
+          git commit -m "Record personal check-in" || true
+          git push
+
+      - name: Check deadline and email me
+        if: github.event_name == 'schedule'
+        env:
+          MAIL_USERNAME: ${{ secrets.MAIL_USERNAME }}
+          MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
+          ALERT_TO: ${{ secrets.ALERT_TO }}
+        run: |
+          python - <<'PY'
+          import os, smtplib
+          from pathlib import Path
+          from datetime import datetime, timezone, timedelta
+          from email.message import EmailMessage
+
+          file = Path("last_checkin.txt")
+          if not file.exists():
+              print("No check-in yet. Run this workflow manually first.")
+              raise SystemExit(0)
+
+          last = datetime.fromisoformat(file.read_text().strip())
+          if last.tzinfo is None:
+              last = last.replace(tzinfo=timezone.utc)
+
+          elapsed = datetime.now(timezone.utc) - last
+          print(f"Hours since check-in: {elapsed.total_seconds()/3600:.1f}")
+
+          if elapsed < timedelta(hours=96):
+              print("Check-in is still current.")
+              raise SystemExit(0)
+
+          msg = EmailMessage()
+          msg["Subject"] = "96-hour check-in overdue"
+          msg["From"] = os.environ["MAIL_USERNAME"]
+          msg["To"] = os.environ["ALERT_TO"]
+          msg.set_content(
+              "Your GitHub watchdog has not received a check-in "
+              "for 96 hours. Please review your account and "
+              "confirm that you are still in control."
+          )
+
+          with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+              smtp.login(
+                  os.environ["MAIL_USERNAME"],
+                  os.environ["MAIL_PASSWORD"]
+              )
+              smtp.send_message(msg)
+
+          print("Overdue notification emailed.")
+          PY
