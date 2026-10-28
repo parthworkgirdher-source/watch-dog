@@ -3,6 +3,15 @@ name: 96-hour check-in watchdog
 
 on:
   workflow_dispatch:
+    inputs:
+      action:
+        description: "Choose what to do"
+        required: true
+        type: choice
+        options:
+          - checkin
+          - test_email
+        default: checkin
   schedule:
     - cron: "0 */6 * * *"
 
@@ -12,70 +21,95 @@ permissions:
 jobs:
   watchdog:
     runs-on: ubuntu-latest
+
     steps:
       - name: Get repository files
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
       - name: Record my check-in
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && inputs.action == 'checkin'
         run: |
           git pull --rebase origin main
           python -c "from datetime import datetime, timezone; open('last_checkin.txt','w').write(datetime.now(timezone.utc).isoformat())"
           git config user.name "github-actions[bot]"
-          git config user.email "41898282+users.noreply.github.com"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add last_checkin.txt
           git commit -m "Record personal check-in" || true
           git push
 
-      - name: Check deadline and email me
-        if: github.event_name == 'schedule'
+      - name: Check deadline or send test email
+        if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.action == 'test_email')
         env:
           MAIL_USERNAME: ${{ secrets.MAIL_USERNAME }}
           MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
           ALERT_TO: ${{ secrets.ALERT_TO }}
+          EVENT_NAME: ${{ github.event_name }}
+          SELECTED_ACTION: ${{ inputs.action }}
         run: |
           python - <<'PY'
-          import os, smtplib
+          import os
+          import smtplib
           from pathlib import Path
           from datetime import datetime, timezone, timedelta
           from email.message import EmailMessage
 
-          file = Path("last_checkin.txt")
-          if not file.exists():
-              print("No check-in yet. Run this workflow manually first.")
-              raise SystemExit(0)
+          username = os.environ.get("MAIL_USERNAME", "")
+          password = os.environ.get("MAIL_PASSWORD", "")
+          recipient = os.environ.get("ALERT_TO", "")
 
-          last = datetime.fromisoformat(file.read_text().strip())
-          if last.tzinfo is None:
-              last = last.replace(tzinfo=timezone.utc)
+          if not username or not password or not recipient:
+              raise SystemExit(
+                  "Missing email secrets. Check MAIL_USERNAME, "
+                  "MAIL_PASSWORD and ALERT_TO in GitHub Settings."
+              )
 
-          elapsed = datetime.now(timezone.utc) - last
-          print(f"Hours since check-in: {elapsed.total_seconds()/3600:.1f}")
+          test_mode = os.environ.get("SELECTED_ACTION") == "test_email"
 
-          if elapsed < timedelta(hours=96):
-              print("Check-in is still current.")
-              raise SystemExit(0)
+          if not test_mode:
+              file = Path("last_checkin.txt")
+              if not file.exists():
+                  print("No check-in timestamp found.")
+                  raise SystemExit(1)
+
+              last = datetime.fromisoformat(file.read_text().strip())
+              if last.tzinfo is None:
+                  last = last.replace(tzinfo=timezone.utc)
+
+              elapsed = datetime.now(timezone.utc) - last
+              print(f"Hours since check-in: {elapsed.total_seconds()/3600:.1f}")
+
+              if elapsed < timedelta(hours=96):
+                  print("Check-in is still current; no alert needed.")
+                  raise SystemExit(0)
 
           msg = EmailMessage()
-          msg["Subject"] = "96-hour check-in overdue"
-          msg["From"] = os.environ["MAIL_USERNAME"]
-          msg["To"] = os.environ["ALERT_TO"]
-          msg.set_content(
-              "Your GitHub watchdog has not received a check-in "
-              "for 96 hours. Please review your account and "
-              "confirm that you are still in control."
-          )
+          msg["From"] = username
+          msg["To"] = recipient
+
+          if test_mode:
+              msg["Subject"] = "Watchdog email test"
+              msg.set_content(
+                  "Success! Your GitHub watchdog can send email. "
+                  "This is a test message, not an overdue alert."
+              )
+          else:
+              msg["Subject"] = "96-hour check-in overdue"
+              msg.set_content(
+                  "Your watchdog has not received a check-in for "
+                  "96 hours. Please review your account and "
+                  "confirm that you are still in control."
+              )
 
           with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
-              smtp.login(
-                  os.environ["MAIL_USERNAME"],
-                  os.environ["MAIL_PASSWORD"]
-              )
+              smtp.login(username, password)
               smtp.send_message(msg)
 
-          print("Overdue notification emailed.")
+          print("Test email sent." if test_mode else "Overdue email sent.")
           PY
